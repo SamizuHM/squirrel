@@ -27,6 +27,56 @@ final class SquirrelInputController: IMKInputController {
   private var chordTimer: Timer?
   private var chordDuration: TimeInterval = 0
   private var currentApp: String = ""
+  private let jev = JevRanking()
+  private var jevFrozenInput: String?
+  private var jevApplying = false
+
+  private func jevProperty(_ name: String) -> String {
+    var bytes = [CChar](repeating: 0, count: 65536)
+    guard rimeAPI.get_property(session, name, &bytes, bytes.count) else { return "" }
+    return String(cString: bytes)
+  }
+
+  private func jevSnapshot() -> JevRanking.Snapshot? {
+    guard session != 0, JevRanking.enabled, rimeAPI.get_option(session, "jev_enabled"),
+          !rimeAPI.get_option(session, "ascii_mode"), let client = client,
+          let pointer = rimeAPI.get_input(session) else { return nil }
+    let input = String(cString: pointer)
+    guard !input.isEmpty, input.utf8.count <= 128, input != jevFrozenInput,
+          let context = JevReadContext(client),
+          let before = context["before"], let after = context["after"],
+          !before.isEmpty || !after.isEmpty else { return nil }
+    let request = jevProperty("jev_request")
+    guard request.hasPrefix(input + ":") else { return nil }
+    guard let candidates = JevRanking.candidates(request) else { return nil }
+    return .init(before: before, after: after, input: input, schema: schemaId,
+                 request: request, candidates: candidates)
+  }
+
+  private func updateJev() {
+    guard !jevApplying else { return }
+    guard let snapshot = jevSnapshot() else { jev.cancel(); return }
+    jev.submit(snapshot, current: { [weak self] in self?.jevSnapshot() }) { [weak self] order in
+      guard let self = self else { return }
+      self.rimeAPI.set_property(self.session, "jev_order", order)
+      self.rimeAPI.set_property(self.session, "jev_order_key", snapshot.request)
+      self.rimeAPI.set_property(self.session, "jev_refresh", "1")
+      self.jevApplying = true
+      _ = self.rimeAPI.process_key(self.session, 0xffd5, 0)
+      self.rimeUpdate()
+      self.jevApplying = false
+    }
+  }
+
+  private func freezeJev() {
+    jev.cancel()
+    jevFrozenInput = rimeAPI.get_input(session).map { String(cString: $0) }
+  }
+
+  @objc private func showJevSettings() {
+    jev.cancel()
+    JevRanking.showSettings()
+  }
 
   // swiftlint:disable:next cyclomatic_complexity
   override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
@@ -124,6 +174,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   func selectCandidate(_ index: Int) -> Bool {
+    freezeJev()
     let success = rimeAPI.select_candidate_on_current_page(session, index)
     if success {
       rimeUpdate()
@@ -133,6 +184,7 @@ final class SquirrelInputController: IMKInputController {
 
   // swiftlint:disable:next identifier_name
   func page(up: Bool) -> Bool {
+    freezeJev()
     var handled = false
     handled = rimeAPI.change_page(session, up)
     if handled {
@@ -142,6 +194,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   func moveCaret(forward: Bool) -> Bool {
+    freezeJev()
     let currentCaretPos = rimeAPI.get_caret_pos(session)
     guard let input = rimeAPI.get_input(session) else { return false }
     if forward {
@@ -219,6 +272,8 @@ final class SquirrelInputController: IMKInputController {
   }
 
   override func deactivateServer(_ sender: Any!) {
+    jev.cancel()
+    jevFrozenInput = nil
     hidePalettes()
     commitComposition(sender)
     client = nil
@@ -230,6 +285,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   override func commitComposition(_ sender: Any!) {
+    jev.cancel()
     self.client ?= sender as? IMKTextInput
     if session != 0 {
       if let input = rimeAPI.get_input(session) {
@@ -255,6 +311,9 @@ final class SquirrelInputController: IMKInputController {
     update.target = self
 
     let menu = NSMenu()
+    let jevSettings = NSMenuItem(title: "Jev API key / 推荐设置…", action: #selector(showJevSettings), keyEquivalent: "")
+    jevSettings.target = self
+    menu.addItem(jevSettings)
     menu.addItem(deploy)
     menu.addItem(sync)
     menu.addItem(logDir)
@@ -392,6 +451,7 @@ private extension SquirrelInputController {
   }
 
   func destroySession() {
+    jev.cancel()
     if session != 0 {
       _ = rimeAPI.destroy_session(session)
       session = 0
@@ -400,6 +460,9 @@ private extension SquirrelInputController {
   }
 
   func processKey(_ rimeKeycode: UInt32, modifiers rimeModifiers: UInt32) -> Bool {
+    if [XK_Up, XK_Down, XK_Left, XK_Right, XK_Page_Up, XK_Page_Down].contains(Int32(rimeKeycode)) {
+      freezeJev()
+    }
     if let panel = NSApp.squirrelAppDelegate.panel {
       if panel.linear != rimeAPI.get_option(session, "_linear") {
         rimeAPI.set_option(session, "_linear", panel.linear)
@@ -446,6 +509,7 @@ private extension SquirrelInputController {
 
   // Preserve reserved comment marks when librime requests a UI-only refresh.
   func rimeUpdate(clearReservedComments: Bool = true) {
+    defer { updateJev() }
     if clearReservedComments {
       specialCommentIndices = [:]
     }
